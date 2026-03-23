@@ -1,0 +1,8 @@
+build/
+*.vvp
+*.vcd
+__pycache__/
+*.pyc
+host/venv/
+*.json
+!host/requirements.txt
