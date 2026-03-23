@@ -1,8 +1,7 @@
 """ULC register map and constants — mirrors ulc_pkg.sv."""
 
-# Chip identity
-CHIP_ID_VALUE = 0xULC10001  # noqa: E999 — hex placeholder
-CHIP_ID_VALUE = 0x554C4331  # 'ULC1' in ASCII-ish hex
+# Chip identity — matches ulc_pkg.sv CHIP_ID_VALUE
+CHIP_ID_VALUE = 0x554C4331  # 'ULC1' in ASCII hex
 CHIP_REV_VALUE = 0x00000001
 
 # Register addresses (byte-addressed)
