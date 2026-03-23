@@ -1,29 +1,33 @@
 // Universal Learning Chip — shared types, constants, and register map
-// v2.2 — Review decisions applied:
-//         - BANK_SELECT + 8-bit offset addressing (no 16-bit UART change)
-//         - PLL_OUT pad dropped (measure internally)
-//         - Pad consolidation (ROSC muxed, DBG shared with GPIO)
-//         - Simple register-addressed switch fabric (not NxM crossbar)
-//         - Single-register serial protocol retained (no burst)
-//         - Software reset added
-//         - I2C marked optional
+// v2.3 — Incremental refinement:
+//         - I2C removed (freed 2 pads, ~2K gates)
+//         - Spare pads: SPARE_DBG + SPARE_ANA with register-controlled routing
+//         - Switch fabric split: perimeter shim + center core
+//         - Debug clock output mux (shared via DBG/GP or SPARE_DBG)
+//         - ROSC dual-mode: auto-follow FSM + register override
+//         - DBG/GP default to GPIO mode on reset
+//         - State snapshot registers for bring-up debugging
+//         - Local reset bits (sequencer, analog subsystem, dangerous zone)
+//         - "Must work without optional blocks" guarantee documented
+//         - Protocol unchanged: single-register R/W, BANK_SELECT paging
 package ulc_pkg;
 
   // ---------------------------------------------------------------
   // Chip identity
   // ---------------------------------------------------------------
   localparam logic [31:0] CHIP_ID_VALUE  = 32'h554C_4332;  // 'ULC2' ASCII
-  localparam logic [31:0] CHIP_REV_VALUE = 32'h0000_0003;   // rev 3 (v2.2)
+  localparam logic [31:0] CHIP_REV_VALUE = 32'h0000_0004;   // rev 4 (v2.3)
 
   // ---------------------------------------------------------------
   // Block IDs — Zone A: Digital Backbone / Safe Core
   // ---------------------------------------------------------------
   typedef enum logic [7:0] {
+    // Zone A: Digital Backbone / Safe Core
     BLK_REGBANK     = 8'h00,
     BLK_SRAM        = 8'h01,
     BLK_UART        = 8'h02,
     BLK_SPI         = 8'h03,
-    BLK_I2C         = 8'h04,
+    // 0x04 reserved (was I2C, removed in v2.3)
     BLK_GPIO        = 8'h05,
     BLK_CLK_DIV     = 8'h07,
     // Zone B: Measurable Mixed-Signal
@@ -32,18 +36,18 @@ package ulc_pkg;
     BLK_PUF         = 8'h09,
     BLK_COMPARATOR  = 8'h0A,
     BLK_ADC         = 8'h0B,
-    BLK_DAC         = 8'h0D,   // NEW — DAC block
-    BLK_ANA_ROUTE   = 8'h0E,   // NEW — Analog route matrix (not independently tested)
-    // Zone C: Experimental Clock
-    BLK_PLL         = 8'h10,   // NEW — PLL/DPLL experiment
-    BLK_CLK_MUX     = 8'h11,   // NEW — Clock mux tree (status only)
-    // Zone D: Experimental / Dangerous
+    BLK_DAC         = 8'h0D,
+    BLK_ANA_ROUTE   = 8'h0E,   // analog route matrix (status only)
+    // Zone C: Experimental Clock (optional — chip works without)
+    BLK_PLL         = 8'h10,   // optional PLL/DPLL experiment
+    BLK_CLK_MUX     = 8'h11,   // clock mux tree (status only)
+    // Zone D: Experimental / Dangerous (optional — chip works without)
     BLK_NVM         = 8'h0C,
     // Infrastructure (not independently selectable)
-    BLK_BIST_ENGINE = 8'h20    // NEW — BIST serial-pattern engine
+    BLK_BIST_ENGINE = 8'h20
   } block_id_t;
 
-  localparam int NUM_BLOCKS = 16;  // testable blocks (0x00..0x11, excl infrastructure)
+  localparam int NUM_BLOCKS = 15;  // testable blocks (was 16, I2C removed)
 
   // ---------------------------------------------------------------
   // Test commands
@@ -132,6 +136,11 @@ package ulc_pkg;
   localparam int CTRL_BIST_ENABLE     = 7;
   localparam int CTRL_LAB_MODE        = 8;  // enables combined experiments
   localparam int CTRL_SOFTWARE_RESET  = 9;  // v2.2: software reset (self-clearing)
+  // v2.3 local reset bits
+  localparam int CTRL_RESET_SEQUENCER = 10; // reset sequencer only
+  localparam int CTRL_RESET_ANALOG    = 11; // reset DAC/ADC/comp state
+  localparam int CTRL_RESET_DANGEROUS = 12; // reset + disarm dangerous zone
+  localparam int CTRL_DEBUG_MODE      = 13; // switch DBG/GP pads to debug output
 
   // ---------------------------------------------------------------
   // Global status register bits
@@ -203,6 +212,15 @@ package ulc_pkg;
   localparam logic [7:0] REG_EXPERIMENT_STATUS = 8'h54;
   localparam logic [7:0] REG_EXPERIMENT_CONFIG = 8'h58;
   localparam logic [7:0] REG_SOFTWARE_RESET    = 8'h5C;  // v2.2: write 0xDEAD
+  // v2.3: State snapshot registers (read-only, bring-up debugging)
+  localparam logic [7:0] REG_SNAP_BANK_CLK    = 8'h60;  // [3:0] bank_sel, [14:12] adc_clk, [17:15] dac_clk
+  localparam logic [7:0] REG_SNAP_ROUTE_EXP   = 8'h64;  // [2:0] adc_src, [5:3] comp+, [8:6] comp-, [23:16] exp_id
+  localparam logic [7:0] REG_SNAP_SEQ_ERR     = 8'h68;  // [4:0] seq_state, [12:8] last_error, [20:16] last_block
+  localparam logic [7:0] REG_SNAP_FLAGS       = 8'h6C;  // [0] pll_locked, [1] dac_active, [2] bist_applied,
+                                                          //  [3] route_active, [4] dangerous_armed, [5] debug_mode
+  // v2.3: Debug and spare pad control
+  localparam logic [7:0] REG_DEBUG_CONTROL    = 8'h70;  // [0] debug_mode, [3:1] dbg_clk_select, [4] dbg_clk_enable
+  localparam logic [7:0] REG_SPARE_PAD_CTRL   = 8'h74;  // [3:0] spare_dbg source, [7:4] spare_ana source, [8] spare_dbg_oe, [9] spare_ana_oe
 
   // ---------------------------------------------------------------
   // Bank 1: Clock — mux tree, PLL, freq counters
@@ -217,6 +235,9 @@ package ulc_pkg;
   localparam logic [7:0] REG_PLL_STATUS        = 8'h24;
   localparam logic [7:0] REG_PLL_FREQ_COUNT    = 8'h28;
   localparam logic [7:0] REG_PLL_LOCK_TIMEOUT  = 8'h2C;
+  // v2.3: ROSC and debug clock
+  localparam logic [7:0] REG_ROSC_CONTROL     = 8'h30;  // [0] mode (0=auto, 1=override), [3:1] osc_select
+  localparam logic [7:0] REG_DBG_CLK_SELECT   = 8'h34;  // [2:0] source (ext/div/rosc/pll/test), [3] enable output
 
   // ---------------------------------------------------------------
   // Bank 2: Analog — route matrix, DAC, ADC, comparator
@@ -461,6 +482,32 @@ package ulc_pkg;
     logic        bypass_active;
     logic [31:0] freq_count;     // measured output frequency count
   } pll_status_t;
+
+  // ---------------------------------------------------------------
+  // v2.3: Debug clock output mux sources
+  // Shared via DBG/GP0 (debug mode) or SPARE_DBG pad
+  // ---------------------------------------------------------------
+  typedef enum logic [2:0] {
+    DBGCLK_DISABLED   = 3'h0,
+    DBGCLK_EXT_REF    = 3'h1,
+    DBGCLK_DIV_SYS    = 3'h2,
+    DBGCLK_RING_OSC   = 3'h3,
+    DBGCLK_PLL_OUT    = 3'h4,
+    DBGCLK_TEST_GEN   = 3'h5
+  } debug_clk_source_t;
+
+  // ---------------------------------------------------------------
+  // v2.3: Spare pad routing sources
+  // ---------------------------------------------------------------
+  typedef enum logic [3:0] {
+    SPARE_SRC_HIZ        = 4'h0,  // high-impedance (safe default)
+    SPARE_SRC_DBG_CLK    = 4'h1,  // debug clock mux output
+    SPARE_SRC_SEQ_STATE  = 4'h2,  // sequencer state bits
+    SPARE_SRC_GPIO_EXT   = 4'h3,  // extension GPIO
+    SPARE_SRC_BIST_OUT   = 4'h4,  // BIST capture readback
+    SPARE_SRC_ROSC_PROBE = 4'h5,  // ring oscillator probe
+    SPARE_SRC_ANALOG_MON = 4'h6   // analog monitor (for SPARE_ANA)
+  } spare_pad_source_t;
 
   // ---------------------------------------------------------------
   // Dangerous block classification
