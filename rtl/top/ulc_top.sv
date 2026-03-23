@@ -1,6 +1,7 @@
-// Universal Learning Chip — Top-level integration
-// Connects: UART bridge -> register bank -> sequencer -> test_mux -> block wrappers
-//           + log buffer + LED status
+// Universal Learning Chip — Top-level integration (v2)
+// Connects: Host -> Registers -> Sequencer -> Test Mux -> Block Wrappers
+//           + BIST Engine + Clock Mux Tree + Analog Route Matrix
+//           + Experiment Profiles + DAC + PLL + Log Buffer + LED Status
 module ulc_top
   import ulc_pkg::*;
 #(
@@ -10,7 +11,7 @@ module ulc_top
   input  logic       clk,
   input  logic       rst_n,
 
-  // UART
+  // UART host interface
   input  logic       uart_rx,
   output logic       uart_tx,
 
@@ -33,9 +34,10 @@ module ulc_top
   output logic [3:0]  osc_en,
   input  logic [3:0]  osc_in,
 
-  // Clock mux measurement
+  // Clock measurement / external reference
   output logic [1:0]  clk_sel,
   input  logic        clk_meas_in,
+  input  logic        clk_ext_ref,    // v2: external reference clock
 
   // TRNG entropy source
   input  logic        entropy_bit,
@@ -65,7 +67,7 @@ module ulc_top
   output logic        nvm_program,
   input  logic        nvm_busy,
 
-  // SPI (directly exposed for external loopback testing)
+  // SPI (external loopback testing)
   output logic        spi_clk_o,
   output logic        spi_mosi,
   input  logic        spi_miso,
@@ -74,7 +76,14 @@ module ulc_top
   // I2C
   output logic        i2c_scl_o,
   output logic        i2c_sda_o,
-  input  logic        i2c_sda_i
+  input  logic        i2c_sda_i,
+
+  // v2: DAC analog output pin
+  output logic [DAC_BITS-1:0] dac_analog_out,
+  output logic                dac_analog_valid,
+
+  // v2: External analog input pin (to route matrix)
+  input  logic [11:0]         ext_analog_in
 );
 
   // ---------------------------------------------------------------
@@ -158,7 +167,167 @@ module ulc_top
   );
 
   // ---------------------------------------------------------------
-  // Test sequencer
+  // v2: BIST Pattern Engine
+  // ---------------------------------------------------------------
+  logic [BIST_CHAIN_WIDTH-1:0] bist_chain_analog;
+  logic [BIST_CHAIN_WIDTH-1:0] bist_chain_clock;
+  logic [BIST_CHAIN_WIDTH-1:0] bist_chain_test_en;
+  logic [BIST_CHAIN_WIDTH-1:0] bist_chain_route;
+  logic [BIST_CHAIN_WIDTH-1:0] bist_chain_fault;
+  logic                        bist_loaded, bist_applied;
+  logic [31:0]                 bist_rdata;
+
+  bist_pattern_engine u_bist (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .host_wr          (host_wr),
+    .host_addr        (host_addr),
+    .host_wdata       (host_wdata),
+    .host_rdata       (bist_rdata),
+    .bist_enable      (reg_global_control[CTRL_BIST_ENABLE]),
+    .chain_analog_mux (bist_chain_analog),
+    .chain_clock_mux  (bist_chain_clock),
+    .chain_test_enable(bist_chain_test_en),
+    .chain_route_config(bist_chain_route),
+    .chain_fault_inject(bist_chain_fault),
+    .patterns_loaded  (bist_loaded),
+    .patterns_applied (bist_applied)
+  );
+
+  // ---------------------------------------------------------------
+  // v2: PLL Experiment
+  // ---------------------------------------------------------------
+  pll_config_t pll_cfg;
+  assign pll_cfg.enable      = reg_global_control[CTRL_PLL_ENABLE];
+  assign pll_cfg.bypass      = 1'b0;  // controlled via PLL_CONTROL register
+  assign pll_cfg.mult_factor = 4'd4;
+  assign pll_cfg.div_factor  = 4'd2;
+
+  logic        pll_clk_out, pll_locked, pll_timeout_flag, pll_bypass_active;
+  logic [31:0] pll_freq_count;
+  test_ctrl_t  pll_ctrl;
+  test_status_t pll_status;
+
+  pll_test_wrapper u_pll (
+    .clk            (clk),
+    .rst_n          (rst_n),
+    .ctrl           (pll_ctrl),
+    .status         (pll_status),
+    .pll_cfg        (pll_cfg),
+    .ref_clk        (clk_ext_ref),
+    .pll_clk_out    (pll_clk_out),
+    .pll_locked     (pll_locked),
+    .pll_timeout    (pll_timeout_flag),
+    .bypass_active  (pll_bypass_active),
+    .pll_freq_count (pll_freq_count)
+  );
+
+  // ---------------------------------------------------------------
+  // v2: Clock Mux Tree
+  // ---------------------------------------------------------------
+  logic        clk_adc_muxed, clk_dac_muxed, clk_bist_muxed, clk_exp_muxed;
+  logic [31:0] clk_freq_result;
+  logic [31:0] clk_mux_rdata;
+  clock_mux_cfg_t clk_active_cfg;
+
+  // Ring oscillator combined output (OR of enabled oscillators)
+  logic ring_osc_combined;
+  assign ring_osc_combined = |osc_in;
+
+  clock_mux_tree u_clk_mux (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .host_wr          (host_wr),
+    .host_addr        (host_addr),
+    .host_wdata       (host_wdata),
+    .host_rdata       (clk_mux_rdata),
+    .clk_ext_ref      (clk_ext_ref),
+    .clk_ring_osc     (ring_osc_combined),
+    .clk_pll_out      (pll_clk_out),
+    .pll_locked       (pll_locked),
+    .bist_clock_chain (bist_chain_clock),
+    .bist_active      (bist_applied),
+    .clk_adc          (clk_adc_muxed),
+    .clk_dac          (clk_dac_muxed),
+    .clk_bist         (clk_bist_muxed),
+    .clk_experiment   (clk_exp_muxed),
+    .freq_count_result(clk_freq_result),
+    .active_config    (clk_active_cfg)
+  );
+
+  // ---------------------------------------------------------------
+  // v2: Analog Route Matrix
+  // ---------------------------------------------------------------
+  analog_source_t adc_input_sel, comp_pos_sel, comp_neg_sel;
+  logic           dac_ext_enable;
+  analog_route_cfg_t route_active;
+  logic              route_contention, route_active_flag;
+  logic [31:0]       aroute_rdata;
+
+  analog_route_matrix u_aroute (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .host_wr          (host_wr),
+    .host_addr        (host_addr),
+    .host_wdata       (host_wdata),
+    .host_rdata       (aroute_rdata),
+    .bist_analog_chain(bist_chain_analog),
+    .bist_active      (bist_applied),
+    .adc_input_sel    (adc_input_sel),
+    .comp_pos_sel     (comp_pos_sel),
+    .comp_neg_sel     (comp_neg_sel),
+    .dac_to_ext_enable(dac_ext_enable),
+    .active_route     (route_active),
+    .route_contention (route_contention),
+    .route_active     (route_active_flag)
+  );
+
+  // ---------------------------------------------------------------
+  // v2: DAC
+  // ---------------------------------------------------------------
+  logic [DAC_BITS-1:0] dac_out_code;
+  logic                dac_out_valid;
+  logic [31:0]         dac_update_cnt;
+  dac_mode_t           dac_active_mode;
+  logic                dac_running;
+  test_ctrl_t          dac_ctrl;
+  test_status_t        dac_status;
+
+  dac_test_wrapper u_dac (
+    .clk             (clk),
+    .rst_n           (rst_n),
+    .ctrl            (dac_ctrl),
+    .status          (dac_status),
+    .dac_enable      (reg_global_control[CTRL_DAC_ENABLE]),
+    .dac_mode        (DAC_MODE_STAIRCASE),  // default; overridden by experiment profile
+    .dac_code_reg    ('0),
+    .dac_alt_code_reg('0),
+    .dac_clk_div     (8'd10),
+    .dac_output_code (dac_out_code),
+    .dac_output_valid(dac_out_valid),
+    .dac_update_count(dac_update_cnt),
+    .dac_active_mode (dac_active_mode),
+    .dac_running     (dac_running),
+    .dac_update_clk  (clk_dac_muxed)
+  );
+
+  // DAC to external pin
+  assign dac_analog_out   = dac_ext_enable ? dac_out_code : '0;
+  assign dac_analog_valid = dac_ext_enable && dac_out_valid;
+
+  // ---------------------------------------------------------------
+  // v2: Experiment Profiles
+  // ---------------------------------------------------------------
+  experiment_id_t      active_exp_id;
+  experiment_profile_t loaded_profile;
+
+  experiment_profiles u_exp (
+    .profile_id (active_exp_id),
+    .profile    (loaded_profile)
+  );
+
+  // ---------------------------------------------------------------
+  // Test sequencer (v2 — extended)
   // ---------------------------------------------------------------
   test_ctrl_t                  blk_ctrl;
   test_status_t                blk_status_muxed;
@@ -167,6 +336,12 @@ module ulc_top
   logic        log_wr;
   log_entry_t  log_entry;
   logic [31:0] log_buf_ptr, log_buf_count;
+
+  // Sequencer v2 signals
+  logic             seq_clk_cfg_valid, seq_route_cfg_valid;
+  clock_mux_cfg_t   seq_clk_cfg;
+  analog_route_cfg_t seq_route_cfg;
+  logic             seq_bist_apply, seq_bist_clear, seq_restore_safe;
 
   test_sequencer u_sequencer (
     .clk               (clk),
@@ -186,7 +361,20 @@ module ulc_top
     .log_entry         (log_entry),
     .log_ptr           (log_buf_ptr),
     .log_count         (log_buf_count),
-    .cycle_count       (cycle_count)
+    .cycle_count       (cycle_count),
+    // v2 ports
+    .active_experiment (active_exp_id),
+    .loaded_profile    (loaded_profile),
+    .clk_cfg_valid     (seq_clk_cfg_valid),
+    .clk_cfg_data      (seq_clk_cfg),
+    .route_cfg_valid   (seq_route_cfg_valid),
+    .route_cfg_data    (seq_route_cfg),
+    .bist_apply_cmd    (seq_bist_apply),
+    .bist_clear_cmd    (seq_bist_clear),
+    .pll_locked        (pll_locked),
+    .pll_timeout       (pll_timeout_flag),
+    .route_contention  (route_contention),
+    .restore_safe      (seq_restore_safe)
   );
 
   // ---------------------------------------------------------------
@@ -199,14 +387,14 @@ module ulc_top
     .rst_n     (rst_n),
     .wr_en     (log_wr),
     .wr_entry  (log_entry),
-    .rd_index  (5'h0),  // TODO: host read index via extra register
+    .rd_index  (5'h0),
     .rd_entry  (log_rd_entry),
     .log_ptr   (log_buf_ptr),
     .log_count (log_buf_count)
   );
 
   // ---------------------------------------------------------------
-  // Test mux
+  // Test mux (extended for new block count)
   // ---------------------------------------------------------------
   test_ctrl_t   ctrl_per_block [NUM_BLOCKS];
   test_status_t status_per_block [NUM_BLOCKS];
@@ -220,153 +408,131 @@ module ulc_top
   );
 
   // ---------------------------------------------------------------
-  // Block wrappers
+  // Block wrappers — Zone A: Digital Backbone
   // ---------------------------------------------------------------
 
   // 0: Register bank self-test
   regbank_test_wrapper u_test_regbank (
-    .clk    (clk),
-    .rst_n  (rst_n),
+    .clk    (clk), .rst_n  (rst_n),
     .ctrl   (ctrl_per_block[BLK_REGBANK]),
     .status (status_per_block[BLK_REGBANK])
   );
 
   // 1: SRAM BIST
   sram_test_wrapper u_test_sram (
-    .clk       (clk),
-    .rst_n     (rst_n),
+    .clk       (clk), .rst_n     (rst_n),
     .ctrl      (ctrl_per_block[BLK_SRAM]),
     .status    (status_per_block[BLK_SRAM]),
-    .sram_addr (sram_addr),
-    .sram_wdata(sram_wdata),
-    .sram_rdata(sram_rdata),
-    .sram_we   (sram_we),
-    .sram_en   (sram_en)
+    .sram_addr (sram_addr), .sram_wdata(sram_wdata),
+    .sram_rdata(sram_rdata), .sram_we(sram_we), .sram_en(sram_en)
   );
 
   // 2: UART loopback
   logic uart_loopback_en;
   uart_test_wrapper u_test_uart (
-    .clk         (clk),
-    .rst_n       (rst_n),
-    .ctrl        (ctrl_per_block[BLK_UART]),
-    .status      (status_per_block[BLK_UART]),
-    .uart_tx     (),  // internal loopback — not routed externally
-    .uart_rx     (1'b1),
-    .loopback_en (uart_loopback_en)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_UART]), .status(status_per_block[BLK_UART]),
+    .uart_tx(), .uart_rx(1'b1), .loopback_en(uart_loopback_en)
   );
 
   // 3: SPI loopback
   spi_test_wrapper u_test_spi (
-    .clk      (clk),
-    .rst_n    (rst_n),
-    .ctrl     (ctrl_per_block[BLK_SPI]),
-    .status   (status_per_block[BLK_SPI]),
-    .spi_clk_o(spi_clk_o),
-    .spi_mosi (spi_mosi),
-    .spi_miso (spi_miso),
-    .spi_cs_n (spi_cs_n)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_SPI]), .status(status_per_block[BLK_SPI]),
+    .spi_clk_o(spi_clk_o), .spi_mosi(spi_mosi),
+    .spi_miso(spi_miso), .spi_cs_n(spi_cs_n)
   );
 
   // 4: I2C
   i2c_test_wrapper u_test_i2c (
-    .clk      (clk),
-    .rst_n    (rst_n),
-    .ctrl     (ctrl_per_block[BLK_I2C]),
-    .status   (status_per_block[BLK_I2C]),
-    .i2c_scl_o(i2c_scl_o),
-    .i2c_sda_o(i2c_sda_o),
-    .i2c_sda_i(i2c_sda_i)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_I2C]), .status(status_per_block[BLK_I2C]),
+    .i2c_scl(i2c_scl_o), .i2c_sda_o(i2c_sda_o), .i2c_sda_i(i2c_sda_i)
   );
 
   // 5: GPIO
   gpio_test_wrapper u_test_gpio (
-    .clk     (clk),
-    .rst_n   (rst_n),
-    .ctrl    (ctrl_per_block[BLK_GPIO]),
-    .status  (status_per_block[BLK_GPIO]),
-    .gpio_out(gpio_out),
-    .gpio_in (gpio_in),
-    .gpio_oe (gpio_oe)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_GPIO]), .status(status_per_block[BLK_GPIO]),
+    .gpio_out(gpio_out), .gpio_in(gpio_in), .gpio_oe(gpio_oe)
   );
+
+  // 7: Clock divider/mux
+  clk_div_test_wrapper u_test_clkdiv (
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_CLK_DIV]), .status(status_per_block[BLK_CLK_DIV]),
+    .clk_sel(clk_sel), .clk_meas_in(clk_meas_in)
+  );
+
+  // ---------------------------------------------------------------
+  // Block wrappers — Zone B: Measurable Mixed-Signal
+  // ---------------------------------------------------------------
 
   // 6: Ring oscillators
   ring_osc_test_wrapper u_test_rosc (
-    .clk    (clk),
-    .rst_n  (rst_n),
-    .ctrl   (ctrl_per_block[BLK_RING_OSC]),
-    .status (status_per_block[BLK_RING_OSC]),
-    .osc_en (osc_en),
-    .osc_in (osc_in)
-  );
-
-  // 7: Clock divider / mux
-  clk_div_test_wrapper u_test_clkdiv (
-    .clk        (clk),
-    .rst_n      (rst_n),
-    .ctrl       (ctrl_per_block[BLK_CLK_DIV]),
-    .status     (status_per_block[BLK_CLK_DIV]),
-    .clk_sel    (clk_sel),
-    .clk_meas_in(clk_meas_in)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_RING_OSC]), .status(status_per_block[BLK_RING_OSC]),
+    .osc_en(osc_en), .osc_in(osc_in)
   );
 
   // 8: TRNG
   trng_test_wrapper u_test_trng (
-    .clk           (clk),
-    .rst_n         (rst_n),
-    .ctrl          (ctrl_per_block[BLK_TRNG]),
-    .status        (status_per_block[BLK_TRNG]),
-    .entropy_bit   (entropy_bit),
-    .entropy_valid (entropy_valid)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_TRNG]), .status(status_per_block[BLK_TRNG]),
+    .entropy_bit(entropy_bit), .entropy_valid(entropy_valid)
   );
 
   // 9: PUF
   puf_test_wrapper u_test_puf (
-    .clk           (clk),
-    .rst_n         (rst_n),
-    .ctrl          (ctrl_per_block[BLK_PUF]),
-    .status        (status_per_block[BLK_PUF]),
-    .puf_challenge (puf_challenge),
-    .puf_response  (puf_response),
-    .puf_valid     (puf_valid)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_PUF]), .status(status_per_block[BLK_PUF]),
+    .puf_challenge(puf_challenge), .puf_response(puf_response), .puf_valid(puf_valid)
   );
 
   // 10: Comparator
   comparator_test_wrapper u_test_comp (
-    .clk           (clk),
-    .rst_n         (rst_n),
-    .ctrl          (ctrl_per_block[BLK_COMPARATOR]),
-    .status        (status_per_block[BLK_COMPARATOR]),
-    .comp_out      (comp_out),
-    .threshold_code(threshold_code)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_COMPARATOR]), .status(status_per_block[BLK_COMPARATOR]),
+    .comp_out(comp_out), .threshold_code(threshold_code)
   );
 
   // 11: ADC
   adc_test_wrapper u_test_adc (
-    .clk        (clk),
-    .rst_n      (rst_n),
-    .ctrl       (ctrl_per_block[BLK_ADC]),
-    .status     (status_per_block[BLK_ADC]),
-    .adc_data   (adc_data),
-    .adc_start  (adc_start),
-    .adc_done   (adc_done),
-    .adc_channel(adc_channel)
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_ADC]), .status(status_per_block[BLK_ADC]),
+    .adc_data(adc_data), .adc_start(adc_start),
+    .adc_done(adc_done), .adc_channel(adc_channel)
   );
+
+  // 13: DAC (connects to test mux for self-test mode)
+  assign dac_ctrl                   = ctrl_per_block[BLK_DAC];
+  assign status_per_block[BLK_DAC]  = dac_status;
+
+  // 14: Analog route matrix (status-only — not independently testable)
+  assign status_per_block[BLK_ANA_ROUTE] = '0;
+
+  // ---------------------------------------------------------------
+  // Block wrappers — Zone C: Experimental Clock
+  // ---------------------------------------------------------------
+
+  // 16: PLL experiment
+  assign pll_ctrl                   = ctrl_per_block[BLK_PLL];
+  assign status_per_block[BLK_PLL]  = pll_status;
+
+  // 17: Clock mux tree (status-only)
+  assign status_per_block[BLK_CLK_MUX] = '0;
+
+  // ---------------------------------------------------------------
+  // Block wrappers — Zone D: Dangerous
+  // ---------------------------------------------------------------
 
   // 12: NVM (dangerous)
   nvm_test_wrapper u_test_nvm (
-    .clk            (clk),
-    .rst_n          (rst_n),
-    .ctrl           (ctrl_per_block[BLK_NVM]),
-    .status         (status_per_block[BLK_NVM]),
+    .clk(clk), .rst_n(rst_n),
+    .ctrl(ctrl_per_block[BLK_NVM]), .status(status_per_block[BLK_NVM]),
     .dangerous_armed(reg_global_control[CTRL_ARM_DANGEROUS]),
-    .nvm_addr       (nvm_addr),
-    .nvm_wdata      (nvm_wdata),
-    .nvm_rdata      (nvm_rdata),
-    .nvm_we         (nvm_we),
-    .nvm_re         (nvm_re),
-    .nvm_program    (nvm_program),
-    .nvm_busy       (nvm_busy)
+    .nvm_addr(nvm_addr), .nvm_wdata(nvm_wdata), .nvm_rdata(nvm_rdata),
+    .nvm_we(nvm_we), .nvm_re(nvm_re), .nvm_program(nvm_program), .nvm_busy(nvm_busy)
   );
 
   // ---------------------------------------------------------------
