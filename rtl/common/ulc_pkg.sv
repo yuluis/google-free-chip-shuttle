@@ -1,13 +1,19 @@
 // Universal Learning Chip — shared types, constants, and register map
-// v2.0 — Extended with DAC, PLL, analog route matrix, clock mux tree,
-//         BIST serial-pattern fabric, and experiment profiles
+// v2.2 — Review decisions applied:
+//         - BANK_SELECT + 8-bit offset addressing (no 16-bit UART change)
+//         - PLL_OUT pad dropped (measure internally)
+//         - Pad consolidation (ROSC muxed, DBG shared with GPIO)
+//         - Simple register-addressed switch fabric (not NxM crossbar)
+//         - Single-register serial protocol retained (no burst)
+//         - Software reset added
+//         - I2C marked optional
 package ulc_pkg;
 
   // ---------------------------------------------------------------
   // Chip identity
   // ---------------------------------------------------------------
   localparam logic [31:0] CHIP_ID_VALUE  = 32'h554C_4332;  // 'ULC2' ASCII
-  localparam logic [31:0] CHIP_REV_VALUE = 32'h0000_0002;
+  localparam logic [31:0] CHIP_REV_VALUE = 32'h0000_0003;   // rev 3 (v2.2)
 
   // ---------------------------------------------------------------
   // Block IDs — Zone A: Digital Backbone / Safe Core
@@ -125,6 +131,7 @@ package ulc_pkg;
   localparam int CTRL_DAC_ENABLE      = 6;
   localparam int CTRL_BIST_ENABLE     = 7;
   localparam int CTRL_LAB_MODE        = 8;  // enables combined experiments
+  localparam int CTRL_SOFTWARE_RESET  = 9;  // v2.2: software reset (self-clearing)
 
   // ---------------------------------------------------------------
   // Global status register bits
@@ -145,11 +152,36 @@ package ulc_pkg;
   localparam int STAT_EXPERIMENT_RUNNING = 12;
 
   // ---------------------------------------------------------------
-  // Register addresses (byte-addressed, 32-bit registers)
-  // Base registers (0x00 - 0x4F)
+  // Register addressing: BANK_SELECT + 8-bit offset
+  //
+  // v2.2 strategy: keep UART at 8-bit addresses. Host writes
+  // BANK_SELECT (offset 0x04) to choose which register page is
+  // active, then uses 8-bit offsets within that bank. Bank 0 is
+  // the default and contains identity/control/status. All existing
+  // 8-bit offsets from v1 remain valid in Bank 0.
+  //
+  // 16-bit flat addressing deferred to future UART bridge revision.
+  // ---------------------------------------------------------------
+
+  // Bank IDs
+  typedef enum logic [3:0] {
+    BANK_GLOBAL     = 4'h0,  // identity, control, status, sequencer, experiment
+    BANK_CLOCK      = 4'h1,  // clock mux, PLL, freq counters
+    BANK_ANALOG     = 4'h2,  // analog route, DAC, ADC, comparator
+    BANK_BIST       = 4'h3,  // BIST engine chains
+    BANK_SECURITY   = 4'h4,  // TRNG, PUF
+    BANK_LOG        = 4'h5,  // log buffer, SRAM BIST
+    BANK_DANGEROUS  = 4'hA   // NVM/OTP (arm required)
+  } bank_id_t;
+
+  localparam int NUM_BANKS = 7;
+
+  // ---------------------------------------------------------------
+  // Bank 0: Global — identity, control, sequencer, experiment
+  // Default bank on reset. All v1 offsets preserved.
   // ---------------------------------------------------------------
   localparam logic [7:0] REG_CHIP_ID           = 8'h00;
-  localparam logic [7:0] REG_CHIP_REV          = 8'h04;
+  localparam logic [7:0] REG_BANK_SELECT       = 8'h04;  // v2.2: bank select
   localparam logic [7:0] REG_GLOBAL_CONTROL    = 8'h08;
   localparam logic [7:0] REG_GLOBAL_STATUS     = 8'h0C;
   localparam logic [7:0] REG_BLOCK_SELECT      = 8'h10;
@@ -166,41 +198,95 @@ package ulc_pkg;
   localparam logic [7:0] REG_LAST_STATE        = 8'h3C;
   localparam logic [7:0] REG_LOG_PTR           = 8'h40;
   localparam logic [7:0] REG_LOG_COUNT         = 8'h44;
-
-  // v2 registers — Experiment & Orchestration (0x50 - 0x5F)
+  localparam logic [7:0] REG_CHIP_REV          = 8'h48;  // moved to avoid collision
   localparam logic [7:0] REG_EXPERIMENT_ID     = 8'h50;
   localparam logic [7:0] REG_EXPERIMENT_STATUS = 8'h54;
   localparam logic [7:0] REG_EXPERIMENT_CONFIG = 8'h58;
+  localparam logic [7:0] REG_SOFTWARE_RESET    = 8'h5C;  // v2.2: write 0xDEAD
 
-  // v2 registers — BIST Pattern Engine (0x60 - 0x6F)
-  localparam logic [7:0] REG_BIST_CONTROL      = 8'h60;
-  localparam logic [7:0] REG_BIST_CHAIN_SEL    = 8'h64;
-  localparam logic [7:0] REG_BIST_SHIFT_DATA   = 8'h68;
-  localparam logic [7:0] REG_BIST_LATCH_STATUS = 8'h6C;
+  // ---------------------------------------------------------------
+  // Bank 1: Clock — mux tree, PLL, freq counters
+  // ---------------------------------------------------------------
+  localparam logic [7:0] REG_CLK_MUX_CONTROL   = 8'h00;  // bank-relative
+  localparam logic [7:0] REG_CLK_MUX_STATUS    = 8'h04;
+  localparam logic [7:0] REG_CLK_FREQ_COUNT    = 8'h08;
+  localparam logic [7:0] REG_CLK_FREQ_SELECT   = 8'h0C;
+  localparam logic [7:0] REG_CLK_FREQ_WINDOW   = 8'h10;
+  localparam logic [7:0] REG_CLK_DIV_CONTROL   = 8'h14;
+  localparam logic [7:0] REG_PLL_CONTROL       = 8'h20;
+  localparam logic [7:0] REG_PLL_STATUS        = 8'h24;
+  localparam logic [7:0] REG_PLL_FREQ_COUNT    = 8'h28;
+  localparam logic [7:0] REG_PLL_LOCK_TIMEOUT  = 8'h2C;
 
-  // v2 registers — Clock Mux Tree (0x70 - 0x7F)
-  localparam logic [7:0] REG_CLK_MUX_CONTROL   = 8'h70;
-  localparam logic [7:0] REG_CLK_MUX_STATUS    = 8'h74;
-  localparam logic [7:0] REG_CLK_FREQ_COUNT    = 8'h78;
-  localparam logic [7:0] REG_CLK_FREQ_SELECT   = 8'h7C;
+  // ---------------------------------------------------------------
+  // Bank 2: Analog — route matrix, DAC, ADC, comparator
+  // ---------------------------------------------------------------
+  localparam logic [7:0] REG_AROUTE_CONTROL    = 8'h00;
+  localparam logic [7:0] REG_AROUTE_STATUS     = 8'h04;
+  localparam logic [7:0] REG_AROUTE_ADC_SRC    = 8'h08;
+  localparam logic [7:0] REG_AROUTE_COMP_SRC   = 8'h0C;
+  localparam logic [7:0] REG_DAC_CONTROL       = 8'h20;
+  localparam logic [7:0] REG_DAC_CODE          = 8'h24;
+  localparam logic [7:0] REG_DAC_STATUS        = 8'h28;
+  localparam logic [7:0] REG_DAC_UPDATE_COUNT  = 8'h2C;
+  localparam logic [7:0] REG_DAC_ALT_CODE      = 8'h30;
+  localparam logic [7:0] REG_DAC_CLK_DIV       = 8'h34;
+  localparam logic [7:0] REG_ADC_CONTROL       = 8'h40;
+  localparam logic [7:0] REG_ADC_RESULT        = 8'h44;
+  localparam logic [7:0] REG_ADC_MIN_MAX       = 8'h48;
+  localparam logic [7:0] REG_ADC_SAMPLE_COUNT  = 8'h4C;
+  localparam logic [7:0] REG_COMP_CONTROL      = 8'h60;
+  localparam logic [7:0] REG_COMP_STATUS       = 8'h64;
+  localparam logic [7:0] REG_COMP_SWEEP_CFG    = 8'h68;
+  localparam logic [7:0] REG_COMP_TRIP_RESULT  = 8'h6C;
 
-  // v2 registers — Analog Route Matrix (0x80 - 0x8F)
-  localparam logic [7:0] REG_AROUTE_CONTROL    = 8'h80;
-  localparam logic [7:0] REG_AROUTE_STATUS     = 8'h84;
-  localparam logic [7:0] REG_AROUTE_ADC_SRC    = 8'h88;
-  localparam logic [7:0] REG_AROUTE_COMP_SRC   = 8'h8C;
+  // ---------------------------------------------------------------
+  // Bank 3: BIST — pattern engine chains
+  // ---------------------------------------------------------------
+  localparam logic [7:0] REG_BIST_CONTROL      = 8'h00;
+  localparam logic [7:0] REG_BIST_CHAIN_SEL    = 8'h04;
+  localparam logic [7:0] REG_BIST_SHIFT_DATA   = 8'h08;
+  localparam logic [7:0] REG_BIST_LATCH_STATUS = 8'h0C;
+  localparam logic [7:0] REG_BIST_READBACK     = 8'h10;
+  localparam logic [7:0] REG_BIST_APPLY_STATUS = 8'h14;
 
-  // v2 registers — DAC (0x90 - 0x9F)
-  localparam logic [7:0] REG_DAC_CONTROL       = 8'h90;
-  localparam logic [7:0] REG_DAC_CODE          = 8'h94;
-  localparam logic [7:0] REG_DAC_STATUS        = 8'h98;
-  localparam logic [7:0] REG_DAC_UPDATE_COUNT  = 8'h9C;
+  // ---------------------------------------------------------------
+  // Bank 4: Security — TRNG, PUF
+  // ---------------------------------------------------------------
+  // (offsets within bank 4)
+  localparam logic [7:0] REG_TRNG_CONTROL      = 8'h00;
+  localparam logic [7:0] REG_TRNG_STATUS       = 8'h04;
+  localparam logic [7:0] REG_TRNG_BIT_COUNT    = 8'h08;
+  localparam logic [7:0] REG_TRNG_ONES_COUNT   = 8'h0C;
+  localparam logic [7:0] REG_TRNG_REP_MAX      = 8'h10;
+  localparam logic [7:0] REG_PUF_CONTROL       = 8'h20;
+  localparam logic [7:0] REG_PUF_STATUS        = 8'h24;
+  localparam logic [7:0] REG_PUF_RESP_0        = 8'h28;
+  localparam logic [7:0] REG_PUF_RESP_1        = 8'h2C;
+  localparam logic [7:0] REG_PUF_RESP_2        = 8'h30;
+  localparam logic [7:0] REG_PUF_RESP_3        = 8'h34;
+  localparam logic [7:0] REG_PUF_MISMATCH      = 8'h38;
 
-  // v2 registers — PLL (0xA0 - 0xAF)
-  localparam logic [7:0] REG_PLL_CONTROL       = 8'hA0;
-  localparam logic [7:0] REG_PLL_STATUS        = 8'hA4;
-  localparam logic [7:0] REG_PLL_FREQ_COUNT    = 8'hA8;
-  localparam logic [7:0] REG_PLL_LOCK_TIMEOUT  = 8'hAC;
+  // ---------------------------------------------------------------
+  // Bank 5: Log — log buffer, SRAM BIST
+  // ---------------------------------------------------------------
+  localparam logic [7:0] REG_LOG_READ_INDEX    = 8'h00;
+  localparam logic [7:0] REG_LOG_ENTRY_BLOCK   = 8'h04;
+  localparam logic [7:0] REG_LOG_ENTRY_T_START = 8'h08;
+  localparam logic [7:0] REG_LOG_ENTRY_T_END   = 8'h0C;
+  localparam logic [7:0] REG_LOG_ENTRY_R0      = 8'h10;
+  localparam logic [7:0] REG_LOG_ENTRY_R1      = 8'h14;
+  localparam logic [7:0] REG_SRAM_BIST_STATUS  = 8'h40;
+
+  // ---------------------------------------------------------------
+  // Bank 0xA: Dangerous — NVM/OTP (arm required)
+  // ---------------------------------------------------------------
+  localparam logic [7:0] REG_DANGEROUS_ARM     = 8'h00;  // write 0x41524D21
+  localparam logic [7:0] REG_NVM_ADDRESS       = 8'h04;
+  localparam logic [7:0] REG_NVM_WRITE_DATA    = 8'h08;
+  localparam logic [7:0] REG_NVM_READ_DATA     = 8'h0C;
+  localparam logic [7:0] REG_NVM_COMMAND       = 8'h10;
+  localparam logic [7:0] REG_NVM_STATUS        = 8'h14;
 
   // ---------------------------------------------------------------
   // Per-block test wrapper interface
