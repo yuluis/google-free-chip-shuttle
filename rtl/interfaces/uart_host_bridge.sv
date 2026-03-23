@@ -1,8 +1,17 @@
-// UART-to-register bridge
-// Simple packet protocol:
-//   Write: [0x57 'W'] [addr] [d3] [d2] [d1] [d0]  -> ACK [0x06]
-//   Read:  [0x52 'R'] [addr]                        -> [d3] [d2] [d1] [d0]
-module uart_host_bridge #(
+// ---------------------------------------------------------------------------
+// uart_host_bridge.sv — v2.4 UART serial command decoder
+//
+// Protocol (115200 8N1):
+//   Write: 'W' addr[7:0] data[31:24] data[23:16] data[15:8] data[7:0] → 'A'
+//   Read:  'R' addr[7:0] → 'D' data[31:24] data[23:16] data[15:8] data[7:0]
+//   Status:'S' → 'S' status[31:24..7:0]  (shortcut: reads GLOBAL_STATUS)
+//   Reset: 'X' → 'A'  (triggers software reset)
+//
+// Address is 8-bit offset within the currently selected bank.
+// Bank is set via BANK_SELECT register (bank 0, offset 0x04).
+// ---------------------------------------------------------------------------
+module uart_host_bridge
+#(
   parameter int CLK_FREQ  = 50_000_000,
   parameter int BAUD_RATE = 115_200
 )(
@@ -22,143 +31,242 @@ module uart_host_bridge #(
   input  logic        reg_rvalid
 );
 
-  // UART core instance
-  logic [7:0] core_tx_data;
-  logic       core_tx_valid;
-  logic       core_tx_ready;
-  logic [7:0] core_rx_data;
-  logic       core_rx_valid;
+  // -----------------------------------------------------------------------
+  // Baud rate generator
+  // -----------------------------------------------------------------------
+  localparam int BAUD_DIV = CLK_FREQ / BAUD_RATE;
 
-  uart_core #(
-    .CLK_FREQ  (CLK_FREQ),
-    .BAUD_RATE (BAUD_RATE)
-  ) u_uart (
-    .clk      (clk),
-    .rst_n    (rst_n),
-    .tx_data  (core_tx_data),
-    .tx_valid (core_tx_valid),
-    .tx_ready (core_tx_ready),
-    .tx_out   (uart_tx),
-    .rx_data  (core_rx_data),
-    .rx_valid (core_rx_valid),
-    .rx_in    (uart_rx)
-  );
-
-  // Bridge FSM
-  typedef enum logic [3:0] {
-    BR_IDLE,
-    BR_GET_ADDR,
-    BR_GET_D3, BR_GET_D2, BR_GET_D1, BR_GET_D0,
-    BR_DO_WRITE, BR_SEND_ACK,
-    BR_DO_READ, BR_WAIT_RVALID,
-    BR_SEND_D3, BR_SEND_D2, BR_SEND_D1, BR_SEND_D0
-  } br_state_t;
-
-  br_state_t br_state;
-  logic [7:0]  cmd_byte;
-  logic [7:0]  addr_byte;
-  logic [31:0] data_buf;
-
-  assign reg_addr  = addr_byte;
-  assign reg_wdata = data_buf;
+  logic [$clog2(BAUD_DIV)-1:0] baud_cnt;
+  logic baud_tick;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      br_state       <= BR_IDLE;
-      cmd_byte       <= 8'h0;
-      addr_byte      <= 8'h0;
-      data_buf       <= 32'h0;
-      reg_wr         <= 1'b0;
-      reg_rd         <= 1'b0;
-      core_tx_data   <= 8'h0;
-      core_tx_valid  <= 1'b0;
+      baud_cnt  <= '0;
+      baud_tick <= 1'b0;
     end else begin
-      reg_wr        <= 1'b0;
-      reg_rd        <= 1'b0;
-      core_tx_valid <= 1'b0;
+      baud_tick <= 1'b0;
+      if (baud_cnt == BAUD_DIV[$clog2(BAUD_DIV)-1:0] - 1) begin
+        baud_cnt  <= '0;
+        baud_tick <= 1'b1;
+      end else begin
+        baud_cnt <= baud_cnt + 1;
+      end
+    end
+  end
 
-      case (br_state)
-        BR_IDLE: begin
-          if (core_rx_valid) begin
-            cmd_byte <= core_rx_data;
-            if (core_rx_data == 8'h57 || core_rx_data == 8'h52) // 'W' or 'R'
-              br_state <= BR_GET_ADDR;
-            // else ignore
+  // -----------------------------------------------------------------------
+  // UART RX — 8N1 receiver
+  // -----------------------------------------------------------------------
+  logic [3:0]  rx_bit_cnt;
+  logic [$clog2(BAUD_DIV)-1:0] rx_baud_cnt;
+  logic [7:0]  rx_shift;
+  logic        rx_busy;
+  logic        rx_done;
+  logic [7:0]  rx_data;
+  logic        rx_sync1, rx_sync2;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rx_sync1 <= 1'b1;
+      rx_sync2 <= 1'b1;
+    end else begin
+      rx_sync1 <= uart_rx;
+      rx_sync2 <= rx_sync1;
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rx_busy     <= 1'b0;
+      rx_bit_cnt  <= '0;
+      rx_baud_cnt <= '0;
+      rx_shift    <= '0;
+      rx_done     <= 1'b0;
+      rx_data     <= '0;
+    end else begin
+      rx_done <= 1'b0;
+
+      if (!rx_busy) begin
+        if (!rx_sync2) begin
+          rx_busy     <= 1'b1;
+          rx_bit_cnt  <= '0;
+          rx_baud_cnt <= BAUD_DIV[$clog2(BAUD_DIV)-1:0] / 2;
+        end
+      end else begin
+        if (rx_baud_cnt == BAUD_DIV[$clog2(BAUD_DIV)-1:0] - 1) begin
+          rx_baud_cnt <= '0;
+          if (rx_bit_cnt == 4'd8) begin
+            rx_busy <= 1'b0;
+            rx_done <= 1'b1;
+            rx_data <= rx_shift;
+          end else begin
+            rx_shift[rx_bit_cnt[2:0]] <= rx_sync2;
+            rx_bit_cnt <= rx_bit_cnt + 1;
+          end
+        end else begin
+          rx_baud_cnt <= rx_baud_cnt + 1;
+        end
+      end
+    end
+  end
+
+  // -----------------------------------------------------------------------
+  // UART TX — 8N1 transmitter
+  // -----------------------------------------------------------------------
+  logic [3:0]  tx_bit_cnt;
+  logic [$clog2(BAUD_DIV)-1:0] tx_baud_cnt;
+  logic [9:0]  tx_shift;
+  logic        tx_busy;
+  logic        tx_start;
+  logic [7:0]  tx_data;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      tx_busy     <= 1'b0;
+      tx_bit_cnt  <= '0;
+      tx_baud_cnt <= '0;
+      tx_shift    <= 10'h3FF;
+      uart_tx     <= 1'b1;
+    end else if (tx_start && !tx_busy) begin
+      tx_shift    <= {1'b1, tx_data, 1'b0};
+      tx_busy     <= 1'b1;
+      tx_bit_cnt  <= '0;
+      tx_baud_cnt <= '0;
+      uart_tx     <= 1'b0;
+    end else if (tx_busy) begin
+      if (tx_baud_cnt == BAUD_DIV[$clog2(BAUD_DIV)-1:0] - 1) begin
+        tx_baud_cnt <= '0;
+        tx_bit_cnt  <= tx_bit_cnt + 1;
+        if (tx_bit_cnt == 4'd9) begin
+          tx_busy <= 1'b0;
+          uart_tx <= 1'b1;
+        end else begin
+          uart_tx <= tx_shift[tx_bit_cnt + 1];
+        end
+      end else begin
+        tx_baud_cnt <= tx_baud_cnt + 1;
+      end
+    end
+  end
+
+  // -----------------------------------------------------------------------
+  // Command state machine
+  // -----------------------------------------------------------------------
+  typedef enum logic [3:0] {
+    ST_IDLE,
+    ST_WRITE_ADDR,
+    ST_WRITE_D3,
+    ST_WRITE_D2,
+    ST_WRITE_D1,
+    ST_WRITE_D0,
+    ST_WRITE_EXEC,
+    ST_WRITE_ACK,
+    ST_READ_ADDR,
+    ST_READ_EXEC,
+    ST_READ_WAIT,
+    ST_READ_RESP,
+    ST_STATUS_EXEC,
+    ST_RESET_EXEC,
+    ST_RESET_ACK
+  } cmd_state_t;
+
+  cmd_state_t state;
+  logic [7:0]  cmd_addr;
+  logic [31:0] cmd_wdata;
+  logic [31:0] cmd_rdata_buf;
+  logic [1:0]  resp_byte_idx;
+
+  // Register bus drives
+  assign reg_wr    = (state == ST_WRITE_EXEC) || (state == ST_RESET_EXEC);
+  assign reg_rd    = (state == ST_READ_EXEC) || (state == ST_STATUS_EXEC);
+  assign reg_addr  = (state == ST_STATUS_EXEC) ? 8'h0C :   // 'S' reads GLOBAL_STATUS
+                     (state == ST_RESET_EXEC)  ? 8'h5C :   // 'X' writes SOFTWARE_RESET
+                     cmd_addr;
+  assign reg_wdata = (state == ST_RESET_EXEC) ? 32'hDEAD : cmd_wdata;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state         <= ST_IDLE;
+      cmd_addr      <= '0;
+      cmd_wdata     <= '0;
+      cmd_rdata_buf <= '0;
+      resp_byte_idx <= '0;
+      tx_start      <= 1'b0;
+      tx_data       <= '0;
+    end else begin
+      tx_start <= 1'b0;
+
+      case (state)
+        ST_IDLE: begin
+          if (rx_done) begin
+            case (rx_data)
+              "W":     state <= ST_WRITE_ADDR;
+              "R":     state <= ST_READ_ADDR;
+              "S":     state <= ST_STATUS_EXEC;
+              "X":     state <= ST_RESET_EXEC;
+              default: state <= ST_IDLE;
+            endcase
           end
         end
 
-        BR_GET_ADDR: begin
-          if (core_rx_valid) begin
-            addr_byte <= core_rx_data;
-            if (cmd_byte == 8'h57)
-              br_state <= BR_GET_D3;
-            else
-              br_state <= BR_DO_READ;
+        // ---- Write: W addr D3 D2 D1 D0 → A ----
+        ST_WRITE_ADDR: if (rx_done) begin cmd_addr <= rx_data; state <= ST_WRITE_D3; end
+        ST_WRITE_D3:   if (rx_done) begin cmd_wdata[31:24] <= rx_data; state <= ST_WRITE_D2; end
+        ST_WRITE_D2:   if (rx_done) begin cmd_wdata[23:16] <= rx_data; state <= ST_WRITE_D1; end
+        ST_WRITE_D1:   if (rx_done) begin cmd_wdata[15:8]  <= rx_data; state <= ST_WRITE_D0; end
+        ST_WRITE_D0:   if (rx_done) begin cmd_wdata[7:0]   <= rx_data; state <= ST_WRITE_EXEC; end
+
+        ST_WRITE_EXEC: state <= ST_WRITE_ACK;
+
+        ST_WRITE_ACK: begin
+          if (!tx_busy) begin
+            tx_start <= 1'b1;
+            tx_data  <= "A";
+            state    <= ST_IDLE;
           end
         end
 
-        // Receive 4 data bytes (MSB first)
-        BR_GET_D3: if (core_rx_valid) begin data_buf[31:24] <= core_rx_data; br_state <= BR_GET_D2; end
-        BR_GET_D2: if (core_rx_valid) begin data_buf[23:16] <= core_rx_data; br_state <= BR_GET_D1; end
-        BR_GET_D1: if (core_rx_valid) begin data_buf[15:8]  <= core_rx_data; br_state <= BR_GET_D0; end
-        BR_GET_D0: if (core_rx_valid) begin data_buf[7:0]   <= core_rx_data; br_state <= BR_DO_WRITE; end
+        // ---- Read: R addr → D D3 D2 D1 D0 ----
+        ST_READ_ADDR: if (rx_done) begin cmd_addr <= rx_data; state <= ST_READ_EXEC; end
 
-        BR_DO_WRITE: begin
-          reg_wr   <= 1'b1;
-          br_state <= BR_SEND_ACK;
-        end
+        ST_READ_EXEC: state <= ST_READ_WAIT;
 
-        BR_SEND_ACK: begin
-          if (core_tx_ready) begin
-            core_tx_data  <= 8'h06; // ACK
-            core_tx_valid <= 1'b1;
-            br_state      <= BR_IDLE;
-          end
-        end
+        // Status shortcut reuses read wait/resp
+        ST_STATUS_EXEC: state <= ST_READ_WAIT;
 
-        BR_DO_READ: begin
-          reg_rd   <= 1'b1;
-          br_state <= BR_WAIT_RVALID;
-        end
-
-        BR_WAIT_RVALID: begin
+        ST_READ_WAIT: begin
           if (reg_rvalid) begin
-            data_buf <= reg_rdata;
-            br_state <= BR_SEND_D3;
+            cmd_rdata_buf <= reg_rdata;
+            resp_byte_idx <= 2'd0;
+            tx_start      <= 1'b1;
+            tx_data       <= (cmd_addr == 8'h0C && state == ST_READ_WAIT) ? "S" : "D";
+            state         <= ST_READ_RESP;
           end
         end
 
-        // Send 4 data bytes (MSB first)
-        BR_SEND_D3: begin
-          if (core_tx_ready) begin
-            core_tx_data  <= data_buf[31:24];
-            core_tx_valid <= 1'b1;
-            br_state      <= BR_SEND_D2;
-          end
-        end
-        BR_SEND_D2: begin
-          if (core_tx_ready) begin
-            core_tx_data  <= data_buf[23:16];
-            core_tx_valid <= 1'b1;
-            br_state      <= BR_SEND_D1;
-          end
-        end
-        BR_SEND_D1: begin
-          if (core_tx_ready) begin
-            core_tx_data  <= data_buf[15:8];
-            core_tx_valid <= 1'b1;
-            br_state      <= BR_SEND_D0;
-          end
-        end
-        BR_SEND_D0: begin
-          if (core_tx_ready) begin
-            core_tx_data  <= data_buf[7:0];
-            core_tx_valid <= 1'b1;
-            br_state      <= BR_IDLE;
+        ST_READ_RESP: begin
+          if (!tx_busy && !tx_start) begin
+            case (resp_byte_idx)
+              2'd0: begin tx_start <= 1'b1; tx_data <= cmd_rdata_buf[31:24]; resp_byte_idx <= 2'd1; end
+              2'd1: begin tx_start <= 1'b1; tx_data <= cmd_rdata_buf[23:16]; resp_byte_idx <= 2'd2; end
+              2'd2: begin tx_start <= 1'b1; tx_data <= cmd_rdata_buf[15:8];  resp_byte_idx <= 2'd3; end
+              2'd3: begin tx_start <= 1'b1; tx_data <= cmd_rdata_buf[7:0];   state <= ST_IDLE; end
+            endcase
           end
         end
 
-        default: br_state <= BR_IDLE;
+        // ---- Reset: X → A ----
+        ST_RESET_EXEC: state <= ST_RESET_ACK;
+
+        ST_RESET_ACK: begin
+          if (!tx_busy) begin
+            tx_start <= 1'b1;
+            tx_data  <= "A";
+            state    <= ST_IDLE;
+          end
+        end
+
+        default: state <= ST_IDLE;
       endcase
     end
   end
