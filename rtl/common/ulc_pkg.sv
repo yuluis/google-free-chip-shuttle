@@ -1,22 +1,17 @@
 // Universal Learning Chip — shared types, constants, and register map
-// v2.3 — Incremental refinement:
-//         - I2C removed (freed 2 pads, ~2K gates)
-//         - Spare pads: SPARE_DBG + SPARE_ANA with register-controlled routing
-//         - Switch fabric split: perimeter shim + center core
-//         - Debug clock output mux (shared via DBG/GP or SPARE_DBG)
-//         - ROSC dual-mode: auto-follow FSM + register override
-//         - DBG/GP default to GPIO mode on reset
-//         - State snapshot registers for bring-up debugging
-//         - Local reset bits (sequencer, analog subsystem, dangerous zone)
-//         - "Must work without optional blocks" guarantee documented
-//         - Protocol unchanged: single-register R/W, BANK_SELECT paging
+// v2.4 — Final v1-targeting refinement:
+//         - Spare pads renamed: SPARE_IO0 + SPARE_IO1 (both digital)
+//         - Standard digital Caravel wrapper confirmed (not analog variant)
+//         - State snapshot registers now latched-on-demand (SNAP_CAPTURE bit)
+//         - BOOT_STATUS register captures reset cause and initial state
+//         - All other v2.3 decisions retained unchanged
 package ulc_pkg;
 
   // ---------------------------------------------------------------
   // Chip identity
   // ---------------------------------------------------------------
   localparam logic [31:0] CHIP_ID_VALUE  = 32'h554C_4332;  // 'ULC2' ASCII
-  localparam logic [31:0] CHIP_REV_VALUE = 32'h0000_0004;   // rev 4 (v2.3)
+  localparam logic [31:0] CHIP_REV_VALUE = 32'h0000_0005;   // rev 5 (v2.4)
 
   // ---------------------------------------------------------------
   // Block IDs — Zone A: Digital Backbone / Safe Core
@@ -141,6 +136,7 @@ package ulc_pkg;
   localparam int CTRL_RESET_ANALOG    = 11; // reset DAC/ADC/comp state
   localparam int CTRL_RESET_DANGEROUS = 12; // reset + disarm dangerous zone
   localparam int CTRL_DEBUG_MODE      = 13; // switch DBG/GP pads to debug output
+  localparam int CTRL_SNAP_CAPTURE    = 14; // v2.4: write 1 to latch snapshots (self-clearing)
 
   // ---------------------------------------------------------------
   // Global status register bits
@@ -212,7 +208,8 @@ package ulc_pkg;
   localparam logic [7:0] REG_EXPERIMENT_STATUS = 8'h54;
   localparam logic [7:0] REG_EXPERIMENT_CONFIG = 8'h58;
   localparam logic [7:0] REG_SOFTWARE_RESET    = 8'h5C;  // v2.2: write 0xDEAD
-  // v2.3: State snapshot registers (read-only, bring-up debugging)
+  // v2.4: State snapshot registers (latched-on-demand via CTRL_SNAP_CAPTURE)
+  // Write CTRL_SNAP_CAPTURE=1 to freeze; reads return coherent frozen image.
   localparam logic [7:0] REG_SNAP_BANK_CLK    = 8'h60;  // [3:0] bank_sel, [14:12] adc_clk, [17:15] dac_clk
   localparam logic [7:0] REG_SNAP_ROUTE_EXP   = 8'h64;  // [2:0] adc_src, [5:3] comp+, [8:6] comp-, [23:16] exp_id
   localparam logic [7:0] REG_SNAP_SEQ_ERR     = 8'h68;  // [4:0] seq_state, [12:8] last_error, [20:16] last_block
@@ -220,7 +217,13 @@ package ulc_pkg;
                                                           //  [3] route_active, [4] dangerous_armed, [5] debug_mode
   // v2.3: Debug and spare pad control
   localparam logic [7:0] REG_DEBUG_CONTROL    = 8'h70;  // [0] debug_mode, [3:1] dbg_clk_select, [4] dbg_clk_enable
-  localparam logic [7:0] REG_SPARE_PAD_CTRL   = 8'h74;  // [3:0] spare_dbg source, [7:4] spare_ana source, [8] spare_dbg_oe, [9] spare_ana_oe
+  localparam logic [7:0] REG_SPARE_PAD_CTRL   = 8'h74;  // [3:0] spare_io0 source, [7:4] spare_io1 source,
+                                                          //  [8] spare_io0_oe, [9] spare_io1_oe
+  // v2.4: Boot / reset status register (read-only, captured at reset release)
+  localparam logic [7:0] REG_BOOT_STATUS      = 8'h78;  // [1:0] reset_cause (0=POR, 1=RST_N, 2=SW_reset, 3=watchdog)
+                                                          //  [2] debug_mode_at_boot, [3] dangerous_armed_at_boot (always 0)
+                                                          //  [6:4] clk_source_at_boot (always ext_ref=0)
+                                                          //  [7] strap_reserved (for future board strap pin)
 
   // ---------------------------------------------------------------
   // Bank 1: Clock — mux tree, PLL, freq counters
@@ -497,7 +500,8 @@ package ulc_pkg;
   } debug_clk_source_t;
 
   // ---------------------------------------------------------------
-  // v2.3: Spare pad routing sources
+  // v2.4: Spare pad routing sources (both pads are digital-only)
+  // Standard digital Caravel — no analog pass-through on spare pads.
   // ---------------------------------------------------------------
   typedef enum logic [3:0] {
     SPARE_SRC_HIZ        = 4'h0,  // high-impedance (safe default)
@@ -506,8 +510,18 @@ package ulc_pkg;
     SPARE_SRC_GPIO_EXT   = 4'h3,  // extension GPIO
     SPARE_SRC_BIST_OUT   = 4'h4,  // BIST capture readback
     SPARE_SRC_ROSC_PROBE = 4'h5,  // ring oscillator probe
-    SPARE_SRC_ANALOG_MON = 4'h6   // analog monitor (for SPARE_ANA)
+    SPARE_SRC_ERR_FLAG   = 4'h6   // error/status flag output
   } spare_pad_source_t;
+
+  // ---------------------------------------------------------------
+  // v2.4: Reset cause encoding for BOOT_STATUS register
+  // ---------------------------------------------------------------
+  typedef enum logic [1:0] {
+    RST_CAUSE_POR        = 2'h0,  // power-on reset
+    RST_CAUSE_PIN        = 2'h1,  // RST_N pin asserted
+    RST_CAUSE_SOFTWARE   = 2'h2,  // software reset (0xDEAD)
+    RST_CAUSE_WATCHDOG   = 2'h3   // reserved for future watchdog
+  } reset_cause_t;
 
   // ---------------------------------------------------------------
   // Dangerous block classification
