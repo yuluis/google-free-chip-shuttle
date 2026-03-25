@@ -1,0 +1,571 @@
+# ULC v3.0 Architecture Definition
+# Status: Draft
+# Machine-readable architecture specification for the tile-based platform
+
+chip:
+  name: Universal Learning Chip
+  version: "3.0"
+  revision_name: Tile Platform
+  chip_id: 0x554C4333  # "ULC3"
+  chip_rev: 0x00000300
+  process: SKY130
+  wrapper: caravel_user_project
+  die_area_mm: [2.92, 3.52]
+  gate_estimate: 77300  # 70K base + 7.3K USB subsystem
+  caravel_capacity: 820000
+  utilization_pct: 9.4
+  pad_count: 38
+  power_domains: 3
+
+# ---------------------------------------------------------------------------
+# Power domains
+# ---------------------------------------------------------------------------
+power_domains:
+  digital:
+    rails: [VDD, VSS]
+    voltage: 1.8
+    pads: [T1, T12, T13, L1, L15, B1, B2]
+    zones: [host_perimeter, gpio_perimeter, digital_core, clock_experiment, routing_margin]
+
+  analog:
+    rails: [VDD_A, VSS_A]
+    voltage: 3.3  # Caravel VDDA1/VDDA2 — 3.3V for max analog headroom
+    caravel_rail: VDDA1
+    pads: [R1, R7]
+    zones: [shared_analog, tile_array]
+    guard_ring_um: 2
+    isolation: level_shifters_1v8_to_3v3
+    devices: [sky130_fd_pr__nfet_03v3_nvt, sky130_fd_pr__pfet_03v3]
+    per_tile_power_gating:
+      enabled: true
+      switch_device: sky130_fd_pr__pfet_03v3
+      switch_size: {W: 50, L: 0.5}  # um
+      rds_on_ohm: 2.5
+      soft_start: true
+      soft_start_time_us: 10
+      power_good_detector: true
+      decoupling_cap_pf: 10
+      register: TILE_POWER_CONTROL  # Bank 6, offset 0xF0
+
+  dangerous:
+    rails: [VDD_E, VSS_E]
+    voltage: 1.8
+    pads: [B6, B7]
+    zones: [dangerous_zone]
+    guard_ring_um: 3
+    isolation: level_shifters
+
+# ---------------------------------------------------------------------------
+# Zones
+# ---------------------------------------------------------------------------
+zones:
+  host_perimeter:
+    location: top_edge
+    area_budget_pct: 15
+    power_domain: digital
+    blocks: [uart_controller, spi_controller, spare_pad_mux, command_decoder]
+    change_from_v24: none
+
+  gpio_perimeter:
+    location: left_edge
+    area_budget_pct: 8
+    power_domain: digital
+    blocks: [gpio_bank, led_driver_bank]
+    change_from_v24: none
+
+  digital_core:
+    location: center
+    area_budget_pct: 40
+    power_domain: digital
+    blocks:
+      - register_bank       # 8 banks, ~148 registers
+      - test_sequencer       # 20-state FSM
+      - tile_controller      # NEW: tile addressing, enable, isolation
+      - bist_engine          # 6 chains (was 5)
+      - experiment_profiles  # extended for tile experiments
+      - event_logger
+      - sram
+      - trng
+      - puf
+      - state_snapshot       # extended for tile state
+      - frequency_counter
+      - clock_divider
+    change_from_v24: added tile_controller, extended sequencer/BIST/profiles/snapshot
+
+  shared_analog:
+    location: right_upper
+    area_budget_pct: 10
+    power_domain: analog
+    blocks:
+      - dac_10bit            # shared, 1 instance
+      - adc_12bit_sar        # shared, 1 instance
+      - comparator           # shared, 1 instance
+      - reference_ladder     # bandgap + resistor divider
+      - analog_route_matrix  # expanded for tiles
+    change_from_v24: extracted from mixed_signal, route matrix expanded
+
+  tile_array:
+    location: right_lower
+    area_budget_pct: 12
+    power_domain: analog
+    layout: 2x3_grid         # 2 columns, 3 rows
+    tile_count: 6
+    reserved_slots: 2        # T6, T7 for future
+    max_tile_area_um: [200, 150]
+    guard_ring_between_tiles_um: 5
+    tiles:
+      - {slot: 0, class: A, dut: ota_5t,          block_id: 0x30}
+      - {slot: 1, class: A, dut: current_mirror,   block_id: 0x31}
+      - {slot: 2, class: B, dut: ring_osc_cs,      block_id: 0x32}
+      - {slot: 3, class: B, dut: delay_line,        block_id: 0x33}
+      - {slot: 4, class: C, dut: flash_adc_3bit,    block_id: 0x34}
+      - {slot: 5, class: D, dut: ldo_lite,          block_id: 0x35}
+    change_from_v24: new zone (replaces mixed_signal)
+
+  clock_experiment:
+    location: bottom_left
+    area_budget_pct: 12
+    power_domain: digital
+    blocks: [pll_wrapper, ring_oscillator, clock_mux, frequency_counter, clock_divider]
+    change_from_v24: none
+
+  routing_margin:
+    location: bottom_center
+    area_budget_pct: 5
+    power_domain: digital
+    blocks: [experiment_profile_rom, profile_decoder]
+    change_from_v24: none
+
+  dangerous_zone:
+    location: bottom_right
+    area_budget_pct: 5
+    power_domain: dangerous
+    blocks: [nvm_controller_stub]
+    change_from_v24: none
+
+# ---------------------------------------------------------------------------
+# Register banks
+# ---------------------------------------------------------------------------
+register_banks:
+  - bank: 0
+    name: Global
+    registers: 31
+    offset_range: [0x00, 0x78]
+    change: "CHIP_ID→ULC3, CHIP_REV→0x300, GLOBAL_CONTROL extended bits 15-17"
+
+  - bank: 1
+    name: Clock
+    registers: 13
+    offset_range: [0x00, 0x38]
+    change: "+1 register (CLK_TILE_SELECT at 0x38)"
+
+  - bank: 2
+    name: Analog
+    registers: 24
+    offset_range: [0x00, 0x84]
+    change: "+6 registers for tile routing (0x70-0x84)"
+
+  - bank: 3
+    name: BIST
+    registers: 7
+    offset_range: [0x00, 0x18]
+    change: "+1 register (BIST_TILE_STATUS at 0x18), chain 5 added"
+
+  - bank: 4
+    name: Security
+    registers: 12
+    offset_range: [0x00, 0x38]
+    change: none
+
+  - bank: 5
+    name: Log
+    registers: 7
+    offset_range: [0x00, 0x40]
+    change: "log entries include tile_id in block_id field"
+
+  - bank: 6
+    name: Tile
+    registers: 49
+    offset_range: [0x00, 0xF0]
+    change: "NEW bank — 8 registers per tile x 6 tiles + 1 power control register at 0xF0"
+    per_tile_registers:
+      - {offset: 0x00, name: TILE_CONTROL, access: RW}
+      - {offset: 0x04, name: TILE_STATUS, access: R}
+      - {offset: 0x08, name: TILE_MODE, access: RW}
+      - {offset: 0x0C, name: TILE_ROUTE_IN, access: RW}
+      - {offset: 0x10, name: TILE_ROUTE_OUT, access: RW}
+      - {offset: 0x14, name: TILE_PARAM, access: RW}
+      - {offset: 0x18, name: TILE_RESULT, access: R}
+      - {offset: 0x1C, name: TILE_DEBUG, access: R}
+    tile_spacing: 0x20  # bytes between tile base addresses
+
+  - bank: 0xA
+    name: Dangerous
+    registers: 6
+    offset_range: [0x00, 0x14]
+    change: none
+
+  - bank: 7
+    name: USB / Communications
+    registers: 12
+    offset_range: [0x00, 0x2C]
+    change: "NEW bank — USB subsystem control/status + dual-interface management"
+    optional: true  # USB subsystem is optional
+
+  total_registers: 161
+
+# ---------------------------------------------------------------------------
+# Block IDs
+# ---------------------------------------------------------------------------
+block_ids:
+  # Zone A — Digital backbone (unchanged)
+  - {id: 0x00, name: REGBANK,     zone: digital_core}
+  - {id: 0x01, name: SRAM,        zone: digital_core}
+  - {id: 0x02, name: UART,        zone: host_perimeter}
+  - {id: 0x03, name: SPI,         zone: host_perimeter}
+  # 0x04 reserved (was I2C)
+  - {id: 0x05, name: GPIO,        zone: gpio_perimeter}
+  - {id: 0x06, name: RING_OSC,    zone: clock_experiment}
+  - {id: 0x07, name: CLK_DIV,     zone: clock_experiment}
+  # Zone B — Shared analog
+  - {id: 0x08, name: TRNG,        zone: digital_core}
+  - {id: 0x09, name: PUF,         zone: digital_core}
+  - {id: 0x0A, name: COMPARATOR,  zone: shared_analog}
+  - {id: 0x0B, name: ADC,         zone: shared_analog}
+  - {id: 0x0C, name: NVM,         zone: dangerous_zone}
+  - {id: 0x0D, name: DAC,         zone: shared_analog}
+  - {id: 0x0E, name: ANA_ROUTE,   zone: shared_analog}
+  # Zone C — Clock
+  - {id: 0x10, name: PLL,         zone: clock_experiment}
+  - {id: 0x11, name: CLK_MUX,     zone: clock_experiment}
+  # Infrastructure
+  - {id: 0x20, name: BIST_ENGINE,  zone: digital_core}
+  # Tiles (NEW)
+  - {id: 0x30, name: TILE_0,      zone: tile_array, dut: ota_5t}
+  - {id: 0x31, name: TILE_1,      zone: tile_array, dut: current_mirror}
+  - {id: 0x32, name: TILE_2,      zone: tile_array, dut: ring_osc_cs}
+  - {id: 0x33, name: TILE_3,      zone: tile_array, dut: delay_line}
+  - {id: 0x34, name: TILE_4,      zone: tile_array, dut: flash_adc_3bit}
+  - {id: 0x35, name: TILE_5,      zone: tile_array, dut: ldo_lite}
+  # 0x36-0x37 reserved (tile 6-7)
+  - {id: 0x40, name: TILE_CTRL,   zone: digital_core}
+  # USB (optional)
+  - {id: 0x50, name: USB_SUBSYSTEM, zone: digital_core, optional: true}
+
+# ---------------------------------------------------------------------------
+# Tile interface contract
+# ---------------------------------------------------------------------------
+tile_interface:
+  digital_control:
+    inputs:
+      - {name: tile_enable,  width: 1,  description: "Master enable"}
+      - {name: tile_reset,   width: 1,  description: "Local reset (active-high)"}
+      - {name: tile_mode,    width: 3,  description: "DUT operating mode"}
+      - {name: tile_start,   width: 1,  description: "Start pulse"}
+      - {name: tile_param,   width: 32, description: "DUT parameter word"}
+    outputs:
+      - {name: tile_done,       width: 1,  description: "Operation complete"}
+      - {name: tile_pass,       width: 1,  description: "Self-test passed"}
+      - {name: tile_error,      width: 1,  description: "Error detected"}
+      - {name: tile_busy,       width: 1,  description: "Operation in progress"}
+      - {name: tile_error_code, width: 4,  description: "Error type"}
+      - {name: tile_result,     width: 32, description: "Primary result"}
+      - {name: tile_debug,      width: 32, description: "Debug word"}
+
+  analog_io:
+    inputs:
+      - {name: stim_a,   type: analog, description: "Primary stimulus"}
+      - {name: stim_b,   type: analog, description: "Secondary stimulus (optional)"}
+      - {name: clk_tile, type: digital, description: "Tile clock input"}
+    outputs:
+      - {name: out_main, type: analog, description: "Primary DUT output"}
+      - {name: tap1,     type: analog, description: "Internal tap 1 (optional)"}
+      - {name: tap2,     type: analog, description: "Internal tap 2 (optional)"}
+
+  power:
+    vdd_tile_voltage: 3.3
+    power_switch: per_tile_pmos_header
+    power_control_register: TILE_POWER_CONTROL  # Bank 6, offset 0xF0
+    power_good_in_status: true  # TILE_STATUS[13]
+
+  isolation:
+    default_state: open  # all switches open at reset (and when unpowered)
+    controlled_by: tile_enable
+    switch_type: transmission_gate_3v3  # sky130 3.3V analog switch
+    switch_devices: [sky130_fd_pr__nfet_03v3_nvt, sky130_fd_pr__pfet_03v3]
+
+  level_shifters:
+    boundary: digital_1v8_to_analog_3v3
+    control_direction: 1v8_to_3v3  # register bits → tile control
+    status_direction: 3v3_to_1v8  # tile status → register readback
+    cells_per_tile: 12  # approximate
+
+  fsm_states: [UNPOWERED, DISABLED, IDLE, RUNNING, DONE, ERROR]
+  timeout_default_cycles: 100000
+  not_present_sentinel: 0xDEADBEEF  # in tile_debug register
+
+# ---------------------------------------------------------------------------
+# Tile assignments (v1)
+# ---------------------------------------------------------------------------
+tile_classes:
+  A:
+    name: Analog Core
+    description: "Op-amp, current mirror, filter, amplifier"
+    max_tiles: 4
+  B:
+    name: Timing
+    description: "Oscillator, delay line, divider"
+    max_tiles: 4
+  C:
+    name: Mixed-Signal
+    description: "ADC stage, DAC cell, comparator variant"
+    max_tiles: 2
+  D:
+    name: Power
+    description: "LDO, bandgap, charge pump"
+    max_tiles: 1  # current limit concern
+
+tiles_v1:
+  - slot: 0
+    class: A
+    name: "5-Transistor OTA"
+    dut_module: tile_dut_ota
+    stim_a_usage: "V+ (non-inverting input)"
+    stim_b_usage: "V- (inverting input)"
+    out_main_usage: "Amplifier output"
+    tap1_usage: "Tail current node"
+    tap2_usage: unused
+    clk_tile_usage: unused
+    estimated_transistors: 12
+    estimated_area_um2: 8000
+
+  - slot: 1
+    class: A
+    name: "Current Mirror Bank"
+    dut_module: tile_dut_mirror
+    stim_a_usage: "Reference current input"
+    stim_b_usage: unused
+    out_main_usage: "Mirrored current output"
+    tap1_usage: "Gate voltage node"
+    tap2_usage: unused
+    clk_tile_usage: unused
+    estimated_transistors: 16
+    estimated_area_um2: 10000
+
+  - slot: 2
+    class: B
+    name: "Current-Starved Ring Oscillator"
+    dut_module: tile_dut_ringosc
+    stim_a_usage: "Vctrl (frequency control voltage)"
+    stim_b_usage: unused
+    out_main_usage: "Oscillator output (digital)"
+    tap1_usage: "Internal ring node (analog)"
+    tap2_usage: unused
+    clk_tile_usage: unused
+    estimated_transistors: 24
+    estimated_area_um2: 12000
+
+  - slot: 3
+    class: B
+    name: "Programmable Delay Line"
+    dut_module: tile_dut_delay
+    stim_a_usage: unused
+    stim_b_usage: unused
+    out_main_usage: "Delayed output"
+    tap1_usage: "Mid-chain tap"
+    tap2_usage: unused
+    clk_tile_usage: "Input signal to delay"
+    estimated_transistors: 20
+    estimated_area_um2: 10000
+
+  - slot: 4
+    class: C
+    name: "3-bit Flash ADC"
+    dut_module: tile_dut_flash_adc
+    stim_a_usage: "Analog input to convert"
+    stim_b_usage: unused
+    out_main_usage: unused
+    tap1_usage: "Comparator threshold midpoint"
+    tap2_usage: unused
+    clk_tile_usage: "Conversion clock"
+    estimated_transistors: 50
+    estimated_area_um2: 20000
+
+  - slot: 5
+    class: D
+    name: "LDO-Lite"
+    dut_module: tile_dut_ldo
+    stim_a_usage: "Reference voltage input"
+    stim_b_usage: unused
+    out_main_usage: "Regulated output voltage"
+    tap1_usage: "Error amplifier output (pass gate)"
+    tap2_usage: unused
+    clk_tile_usage: unused
+    estimated_transistors: 15
+    estimated_area_um2: 12000
+
+# ---------------------------------------------------------------------------
+# Sequencer (extended)
+# ---------------------------------------------------------------------------
+sequencer:
+  total_states: 20
+  new_states:
+    - {name: SEQ_SELECT_TILE,    id: 0x18, description: "Select and enable target tile"}
+    - {name: SEQ_CONFIGURE_TILE, id: 0x19, description: "Write tile mode/param/route"}
+  new_commands:
+    - {name: CMD_SELECT_TILE, id: 0x20, description: "Select tile for operations"}
+    - {name: CMD_TILE_SWEEP,  id: 0x21, description: "Run experiment on all enabled tiles"}
+  new_errors:
+    - {name: ERR_TILE_TIMEOUT,     id: 0x20}
+    - {name: ERR_TILE_OVERCURRENT, id: 0x21}
+    - {name: ERR_TILE_NOT_PRESENT, id: 0x22}
+    - {name: ERR_TILE_ISOLATED,    id: 0x23}
+    - {name: ERR_TILE_NO_POWER,   id: 0x24}
+
+# ---------------------------------------------------------------------------
+# Route matrix expansion
+# ---------------------------------------------------------------------------
+route_matrix:
+  sources:
+    - {id: 0, name: DISCONNECTED}
+    - {id: 1, name: DAC_OUT}
+    - {id: 2, name: EXT_ANALOG_IN}
+    - {id: 3, name: REF_LADDER}
+    - {id: 4, name: RING_OSC_MON}
+    - {id: 5, name: TILE_0_OUT}
+    - {id: 6, name: TILE_1_OUT}
+    - {id: 7, name: TILE_2_OUT}
+    - {id: 8, name: TILE_3_OUT}
+    - {id: 9, name: TILE_4_OUT}
+    - {id: 10, name: TILE_5_OUT}
+
+  destinations:
+    - ADC_INPUT
+    - COMP_POS
+    - COMP_NEG
+    - TILE_0_STIM_A
+    - TILE_0_STIM_B
+    - TILE_1_STIM_A
+    - TILE_1_STIM_B
+    - TILE_2_STIM_A
+    - TILE_2_STIM_B
+    - TILE_3_STIM_A
+    - TILE_3_STIM_B
+    - TILE_4_STIM_A
+    - TILE_4_STIM_B
+    - TILE_5_STIM_A
+    - TILE_5_STIM_B
+    - DAC_OUT_PAD
+    - SPARE_IO0  # unavailable when USB enabled (pads become USB_DP/DM)
+    - SPARE_IO1  # unavailable when USB enabled
+
+  default_state: all_disconnected
+  contention_detection: true
+  max_sources_per_dest: 1
+
+# ---------------------------------------------------------------------------
+# BIST chains
+# ---------------------------------------------------------------------------
+bist:
+  chain_count: 6
+  chain_width: 32
+  chains:
+    - {id: 0, name: ANALOG_MUX,    coverage: "Analog route mux selects"}
+    - {id: 1, name: CLOCK_MUX,     coverage: "Clock source mux selects"}
+    - {id: 2, name: TEST_ENABLE,   coverage: "Per-block test mode enables"}
+    - {id: 3, name: ROUTE_CONFIG,  coverage: "Combined route configuration"}
+    - {id: 4, name: FAULT_INJECT,  coverage: "Optional fault injection bits"}
+    - {id: 5, name: TILE_CONTROL,  coverage: "Per-tile enable, isolation, error flags"}
+
+# ---------------------------------------------------------------------------
+# Communications (dual-interface model)
+# ---------------------------------------------------------------------------
+communications:
+  primary:
+    interface: UART
+    pads: [UART_TX, UART_RX]  # T2, T3 — dedicated, fixed
+    baud: 115200
+    format: 8N1
+    protocol: "W/R/S/X single-register"
+    available_at_reset: true
+    can_be_disabled: "only with explicit safety latch (uart_disable_allowed)"
+    role: "bring-up, debug, recovery, register access"
+
+  secondary:
+    interface: USB
+    speed: full_speed_12mbps
+    device_class: CDC-ACM
+    pads: [SPARE_IO0, SPARE_IO1]  # T8, T9 — dual-function (GPIO default, USB when enabled)
+    pad_mode: dual_function
+    available_at_reset: false
+    enabled_by: USB_CONTROL.usb_enable
+    role: "convenience host interface, secondary serial"
+    block_id: 0x50
+    gate_estimate: 7300
+    clock_requirement: 48MHz
+    optional: true
+
+  spi:
+    mode: slave
+    role: "alternate primary interface"
+    change_from_v24: none
+
+  arbitration:
+    model: priority_mux
+    priority: UART
+    dual_path: true
+    timeout_cycles: 1000
+
+  switchover:
+    auto_promote: configurable  # AUTO_USB_PROMOTE_EN bit
+    uart_always_available: true
+    usb_fallback_to_uart: automatic
+    uart_disable_requires: explicit_safety_latch
+
+# ---------------------------------------------------------------------------
+# Board power model
+# ---------------------------------------------------------------------------
+board_power:
+  usb_vbus:
+    voltage: 5.0
+    role: optional_board_power_source
+    never_reaches_chip: true
+  board_regulators:
+    - {input: "5V (USB or bench)", output: "3.3V", rail: VDD_A, part: AMS1117-3.3}
+    - {input: "3.3V", output: "1.8V", rail: VDD, part: AP2112K-1.8}
+  on_chip_ldo_tile:
+    role: experiment_only
+    not_required_for: primary_power
+
+# ---------------------------------------------------------------------------
+# USB subsystem (optional)
+# ---------------------------------------------------------------------------
+usb_subsystem:
+  register_bank: 7
+  registers: 12
+  components:
+    - usb_fs_phy
+    - usb_sie
+    - usb_cdc_acm
+    - usb_serial_bridge
+    - pad_mux_extension
+    - register_bus_arbiter
+
+  operational_modes:
+    - {id: 0, name: safe_bringup,   uart: active, usb: disabled}
+    - {id: 1, name: usb_power_only, uart: active, usb: disabled}
+    - {id: 2, name: dual_path,      uart: active, usb: active}
+    - {id: 3, name: usb_preferred,  uart: active, usb: preferred}
+    - {id: 4, name: usb_fault,      uart: active, usb: disabled}
+
+# ---------------------------------------------------------------------------
+# Compatibility
+# ---------------------------------------------------------------------------
+compatibility:
+  uart_protocol: identical
+  bank_0_offsets: preserved
+  banks_1_5_A: backward_compatible
+  experiment_profiles_01_0E: valid
+  host_python_driver: minor_update_needed
+  fpga_twin: fully_compatible
+  usb_subsystem: optional_additive  # chip works without USB
